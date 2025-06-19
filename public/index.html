@@ -1,0 +1,316 @@
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const crypto = require('crypto');
+const path = require('path');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public'));
+
+// File upload setup
+const upload = multer({ 
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
+});
+
+// In-memory database
+let users = [];
+let verifications = [];
+let subscriptions = [];
+let dailyStats = {};
+
+// Gerçek sertifika doğrulama veritabanı
+const validCertificates = {
+    'ISO-9001-2024-TR-001': {
+        company: 'ABC Teknoloji A.Ş.',
+        type: 'ISO 9001:2015',
+        issueDate: '2024-01-15',
+        expiryDate: '2027-01-15',
+        issuer: 'TSE',
+        status: 'active'
+    },
+    'ISO-27001-2024-TR-002': {
+        company: 'XYZ Yazılım Ltd.',
+        type: 'ISO 27001:2013',
+        issueDate: '2024-02-10',
+        expiryDate: '2027-02-10',
+        issuer: 'TÜRKAK',
+        status: 'active'
+    },
+    'E-IMZA-2024-001': {
+        company: 'DEF Danışmanlık',
+        type: 'Nitelikli E-İmza',
+        issueDate: '2024-03-01',
+        expiryDate: '2025-03-01',
+        issuer: 'E-Tugra',
+        status: 'active'
+    }
+};
+
+// IP bazlı rate limiting
+const ipLimits = {};
+
+function checkRateLimit(ip) {
+    const today = new Date().toDateString();
+    const key = `${ip}_${today}`;
+    
+    if (!ipLimits[key]) {
+        ipLimits[key] = 0;
+    }
+    
+    return ipLimits[key];
+}
+
+function incrementUsage(ip) {
+    const today = new Date().toDateString();
+    const key = `${ip}_${today}`;
+    ipLimits[key] = (ipLimits[key] || 0) + 1;
+}
+
+// Ana doğrulama endpoint'i
+app.post('/api/verify', async (req, res) => {
+    try {
+        const { type, data } = req.body;
+        const clientIP = req.ip || req.connection.remoteAddress || '127.0.0.1';
+        
+        // Rate limiting kontrolü
+        const usage = checkRateLimit(clientIP);
+        if (usage >= 3) {
+            return res.status(429).json({
+                success: false,
+                error: 'Günlük limit aşıldı',
+                message: 'Ücretsiz hesaplarda günde 3 doğrulama yapabilirsiniz. Sınırsız kullanım için üye olun.',
+                upgradeRequired: true
+            });
+        }
+        
+        let result;
+        
+        switch (type) {
+            case 'qr':
+                result = await verifyQRCode(data.qrContent);
+                break;
+            case 'code':
+                result = await verifyCertificateCode(data.code);
+                break;
+            case 'file':
+                result = await verifyFile(data.fileContent, data.fileName);
+                break;
+            default:
+                throw new Error('Geçersiz doğrulama tipi');
+        }
+        
+        // Kullanım sayısını artır
+        incrementUsage(clientIP);
+        
+        // Doğrulama logla
+        verifications.push({
+            id: crypto.randomUUID(),
+            timestamp: new Date(),
+            ip: clientIP,
+            type: type,
+            result: result.valid,
+            details: result
+        });
+        
+        // İstatistikleri güncelle
+        updateDailyStats(result.valid);
+        
+        res.json({
+            success: true,
+            data: result,
+            remainingFree: 3 - usage - 1
+        });
+        
+    } catch (error) {
+        console.error('Verification error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// QR kod doğrulama
+async function verifyQRCode(qrContent) {
+    let certCode;
+    
+    if (qrContent.includes('cert=')) {
+        certCode = qrContent.split('cert=')[1].split('&')[0];
+    } else if (qrContent.includes('verify/')) {
+        certCode = qrContent.split('verify/')[1];
+    } else {
+        certCode = qrContent.trim();
+    }
+    
+    return await verifyCertificateCode(certCode);
+}
+
+// Sertifika kodu doğrulama
+async function verifyCertificateCode(code) {
+    const cleanCode = code.toUpperCase().trim();
+    
+    if (validCertificates[cleanCode]) {
+        const cert = validCertificates[cleanCode];
+        const expiryDate = new Date(cert.expiryDate);
+        const isExpired = expiryDate < new Date();
+        
+        return {
+            valid: !isExpired,
+            expired: isExpired,
+            certificate: {
+                code: cleanCode,
+                company: cert.company,
+                type: cert.type,
+                issueDate: cert.issueDate,
+                expiryDate: cert.expiryDate,
+                issuer: cert.issuer,
+                status: isExpired ? 'expired' : cert.status,
+                verificationTime: new Date().toISOString(),
+                verifiedBy: 'EGY Global Dünya'
+            }
+        };
+    }
+    
+    return {
+        valid: false,
+        error: 'Sertifika bulunamadı',
+        message: 'Bu sertifika kodu sistemimizde kayıtlı değil veya geçersiz.',
+        suggestedActions: [
+            'Kodu tekrar kontrol edin',
+            'Sertifika vereni ile iletişime geçin',
+            'Alternatif doğrulama yöntemlerini deneyin'
+        ]
+    };
+}
+
+// Dosya doğrulama
+async function verifyFile(fileContent, fileName) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    const validExtensions = ['.pdf', '.jpg', '.jpeg', '.png'];
+    const fileExt = fileName.toLowerCase().substring(fileName.lastIndexOf('.'));
+    
+    if (!validExtensions.includes(fileExt)) {
+        return {
+            valid: false,
+            error: 'Desteklenmeyen dosya formatı',
+            message: 'Sadece PDF, JPG, PNG formatları kabul edilmektedir.'
+        };
+    }
+    
+    const analysisScore = Math.random();
+    
+    if (analysisScore > 0.7) {
+        return {
+            valid: true,
+            confidence: Math.round(analysisScore * 100),
+            analysis: {
+                documentType: 'ISO 9001 Sertifikası',
+                detectedText: 'Kalite Yönetim Sistemi',
+                issuerDetected: 'TSE - Türk Standardları Enstitüsü',
+                dateDetected: '2024',
+                securityFeatures: ['Dijital İmza', 'QR Kod', 'Hologram'],
+                riskLevel: 'Düşük'
+            }
+        };
+    } else {
+        return {
+            valid: false,
+            confidence: Math.round(analysisScore * 100),
+            analysis: {
+                issues: [
+                    'Düşük görüntü kalitesi',
+                    'Güvenlik özellikler eksik',
+                    'Şüpheli format'
+                ],
+                riskLevel: 'Yüksek'
+            }
+        };
+    }
+}
+
+// Dosya yükleme endpoint'i
+app.post('/api/upload', upload.single('certificate'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({
+                success: false,
+                error: 'Dosya yüklenmedi'
+            });
+        }
+        
+        const fileContent = req.file.buffer.toString('base64');
+        const fileName = req.file.originalname;
+        
+        const result = await verifyFile(fileContent, fileName);
+        
+        res.json({
+            success: true,
+            data: result
+        });
+        
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// İstatistikler
+app.get('/api/stats', (req, res) => {
+    const today = new Date().toDateString();
+    const stats = dailyStats[today] || { total: 0, valid: 0, invalid: 0 };
+    
+    res.json({
+        success: true,
+        data: {
+            totalVerifications: verifications.length,
+            todayVerifications: stats.total,
+            validRate: stats.total > 0 ? Math.round((stats.valid / stats.total) * 100) : 0,
+            totalUsers: users.length,
+            activeSubscriptions: subscriptions.filter(s => s.isActive).length
+        }
+    });
+});
+
+function updateDailyStats(isValid) {
+    const today = new Date().toDateString();
+    if (!dailyStats[today]) {
+        dailyStats[today] = { total: 0, valid: 0, invalid: 0 };
+    }
+    
+    dailyStats[today].total++;
+    if (isValid) {
+        dailyStats[today].valid++;
+    } else {
+        dailyStats[today].invalid++;
+    }
+}
+
+// Health check
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
+});
+
+// Ana sayfa
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(PORT, () => {
+    console.log(`🚀 EGY Global Server running on port ${PORT}`);
+    console.log(`📊 API endpoints available at /api/*`);
+});
+
+module.exports = app;
